@@ -34,8 +34,11 @@ type Event struct {
 }
 
 type Config struct {
-	RelayAddress  string
-	RelayPassword string
+	RelayAddress     string
+	RelayPassword    string
+	DisableLocal     bool
+	OnlyLocal        bool
+	MulticastAddress string
 }
 
 var (
@@ -76,11 +79,51 @@ func connect(ctx context.Context, cfg Config, code string, host bool) (*Session,
 	if err != nil {
 		return nil, err
 	}
+
+	useLocal := shouldUseLocal(cfg)
+	if !host && useLocal {
+		window := localDiscoveryTimeout
+		if cfg.OnlyLocal {
+			window = onlyLocalDiscoveryWindow
+		}
+		if localConn, localAddr, localErr := tryJoinLocalChat(ctx, components.RoomName, cfg.RelayPassword, cfg.MulticastAddress, window); localErr == nil {
+			s := newSession(ctx, localConn, components, false, code, localAddr, defaults())
+			s.setTransport(true, localAddr)
+			return s, nil
+		} else if cfg.OnlyLocal {
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+			return nil, localErr
+		}
+	}
+
+	var localHost *localHostRelay
+	if host && useLocal {
+		if lh, localErr := startLocalHostRelay(ctx, components.RoomName, cfg.RelayPassword, cfg.MulticastAddress); localErr == nil {
+			localHost = lh
+		} else if cfg.OnlyLocal {
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+			return nil, localErr
+		}
+	}
+
+	if cfg.OnlyLocal && host && localHost != nil {
+		s := newSessionWithLocal(ctx, nil, localHost, components, true, code, localHost.addr, defaults())
+		return s, nil
+	}
+
 	address := cfg.RelayAddress
 	if address == "" {
 		relays := publicrelay.Relays()
 		index, e := codephrase.RelayIndex(code, len(relays))
 		if e != nil {
+			if localHost != nil {
+				localHost.conn.Close()
+				localHost.stopRelay()
+			}
 			return nil, e
 		}
 		address = relays[index]
@@ -89,6 +132,10 @@ func connect(ctx context.Context, cfg Config, code string, host bool) (*Session,
 	defer cancel()
 	c, _, _, _, err := tcp.ConnectToTCPServerControlContext(admission, address, cfg.RelayPassword, components.RoomName, 30*time.Second)
 	if err != nil {
+		if localHost != nil && host {
+			// External relay unreachable, but local LAN relay is ready.
+			return newSessionWithLocal(ctx, nil, localHost, components, true, code, localHost.addr, defaults()), nil
+		}
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
@@ -97,12 +144,21 @@ func connect(ctx context.Context, cfg Config, code string, host bool) (*Session,
 		}
 		return nil, errors.New("could not join chat relay; check relay settings and availability")
 	}
+	if localHost != nil {
+		return newSessionWithLocal(ctx, c, localHost, components, host, code, address, defaults()), nil
+	}
 	return newSession(ctx, c, components, host, code, address, defaults()), nil
 }
 
 // Code is the host's invitation. Callers must not log it or persist it.
 func (s *Session) Code() string         { s.mu.Lock(); defer s.mu.Unlock(); return s.code }
 func (s *Session) RelayAddress() string { return s.relay }
+func (s *Session) IsLocal() bool        { s.mu.Lock(); defer s.mu.Unlock(); return s.isLocal }
+func (s *Session) TransportStats() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return formatTransportStats(s.isLocal, s.transportAddr)
+}
 func (s *Session) Events() <-chan Event { return s.events }
 func (s *Session) Wait() error          { <-s.done; s.mu.Lock(); defer s.mu.Unlock(); return s.err }
 

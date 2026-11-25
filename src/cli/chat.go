@@ -18,7 +18,7 @@ func validateChatOptions(c *cli.Context) error {
 	if c.Args().Present() {
 		return errors.New("use croc chat --join and paste the invitation at the prompt")
 	}
-	allowed := map[string]bool{"join": true, "relay": true, "relay6": true, "pass": true, "socks5": true, "connect": true, "debug": true, "no-update-check": true, "disable-clipboard": true}
+	allowed := map[string]bool{"join": true, "relay": true, "relay6": true, "pass": true, "socks5": true, "connect": true, "debug": true, "no-update-check": true, "disable-clipboard": true, "local": true, "multicast": true}
 	for _, name := range c.FlagNames() {
 		if c.IsSet(name) && !allowed[name] {
 			return fmt.Errorf("--%s is not supported by croc chat", name)
@@ -26,6 +26,9 @@ func validateChatOptions(c *cli.Context) error {
 	}
 	if c.IsSet("relay") && c.IsSet("relay6") {
 		return errors.New("croc chat accepts only one explicit relay")
+	}
+	if c.Bool("local") && (c.IsSet("relay") || c.IsSet("relay6")) {
+		return errors.New("croc chat cannot combine --local with an explicit relay")
 	}
 	return nil
 }
@@ -44,7 +47,11 @@ func chatSession(c *cli.Context) error {
 	}
 	comm.Socks5Proxy = c.String("socks5")
 	comm.HttpProxy = c.String("connect")
-	cfg := chat.Config{RelayPassword: determinePass(c)}
+	cfg := chat.Config{
+		RelayPassword:    determinePass(c),
+		OnlyLocal:        c.Bool("local"),
+		MulticastAddress: c.String("multicast"),
+	}
 	if c.IsSet("relay") {
 		cfg.RelayAddress = strings.TrimSpace(c.String("relay"))
 	}
@@ -133,8 +140,12 @@ func chatSession(c *cli.Context) error {
 	}
 	defer func() { s.Close(); s.Wait() }()
 	if secret == "" {
-		fmt.Fprintf(os.Stdout, "Chat invitation: %s\r\nRelay: %s\r\nShare the invitation privately. Join with: croc --relay %s chat --join\r\n", s.Code(), safeChatText(s.RelayAddress()), safeChatText(s.RelayAddress()))
-		fmt.Fprint(os.Stdout, "Use the same --pass setting on the joining client if the relay requires one.\r\n")
+		if cfg.OnlyLocal {
+			fmt.Fprintf(os.Stdout, "Chat invitation: %s\r\nMode: Direct LAN only (%s)\r\nShare the invitation privately. Join on the same LAN with: croc --local chat --join\r\n", s.Code(), safeChatText(s.RelayAddress()))
+		} else {
+			fmt.Fprintf(os.Stdout, "Chat invitation: %s\r\nRelay: %s\r\nShare the invitation privately. Join with: croc --relay %s chat --join\r\n", s.Code(), safeChatText(s.RelayAddress()), safeChatText(s.RelayAddress()))
+			fmt.Fprint(os.Stdout, "Use the same --pass setting on the joining client if the relay requires one.\r\n")
+		}
 	}
 	fmt.Fprint(os.Stdout, "Waiting for authentication. Ctrl+C exits.\r\n")
 	return runChatUI(ctx, s, input, os.Stdout)

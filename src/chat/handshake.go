@@ -122,6 +122,10 @@ func sendHandshake(c *comm.Comm, deadline time.Time, m message.Message) error {
 // handshake authenticates a fresh connection; caller owns cancellation and must
 // close the connection on any error. READY is performed by the session writer.
 func handshake(c *comm.Comm, components codephrase.ChatComponents, host bool, wait, auth time.Duration) (send, receive *recordCipher, err error) {
+	return handshakeWithFirst(c, components, host, nil, wait, auth)
+}
+
+func handshakeWithFirst(c *comm.Comm, components codephrase.ChatComponents, host bool, preReceived *message.Message, wait, auth time.Duration) (send, receive *recordCipher, err error) {
 	role := 0
 	if host {
 		role = 1
@@ -133,9 +137,15 @@ func handshake(c *comm.Comm, components codephrase.ChatComponents, host bool, wa
 	deadline := time.Now().Add(auth)
 	var x, y, salt []byte
 	if host {
-		first, readErr := receiveHandshake(c, time.Now().Add(wait), false, false)
-		if readErr != nil {
-			return nil, nil, readErr
+		var first message.Message
+		if preReceived != nil {
+			first = *preReceived
+		} else {
+			var readErr error
+			first, readErr = receiveHandshake(c, time.Now().Add(wait), false, false)
+			if readErr != nil {
+				return nil, nil, readErr
+			}
 		}
 		deadline = time.Now().Add(auth)
 		x = first.Bytes

@@ -228,7 +228,10 @@ func runChatUI(ctx context.Context, s *chat.Session, input <-chan chatInputResul
 				fmt.Fprint(output, "\x1b[2J\x1b[H")
 				return true
 			case "/help":
-				line("/help  /clear  /quit; start with // to send a leading slash")
+				line("/help  /status  /clear  /quit; start with // to send a leading slash")
+				return true
+			case "/status":
+				line("Connection: " + safeChatText(s.TransportStats()))
 				return true
 			default:
 				line("Unknown command. Use /help.")
@@ -278,7 +281,7 @@ func runChatUI(ctx context.Context, s *chat.Session, input <-chan chatInputResul
 			switch e.Type {
 			case chat.Connected:
 				active = true
-				line("Secure chat connected. /help lists commands; Ctrl+C exits.")
+				line(fmt.Sprintf("Secure chat connected [%s]. /help lists commands; Ctrl+C exits.", safeChatText(s.TransportStats())))
 			case chat.MessageReceived:
 				line("Peer: " + safeChatText(e.Text))
 			case chat.Sent:

@@ -11,6 +11,7 @@ import (
 
 	"github.com/schollz/croc/v11/src/codephrase"
 	"github.com/schollz/croc/v11/src/comm"
+	"github.com/schollz/croc/v11/src/message"
 )
 
 type outgoing struct {
@@ -28,6 +29,12 @@ type pendingText struct {
 type Session struct {
 	code, relay               string
 	conn                      *comm.Comm
+	localConn                 *comm.Comm
+	localAddr                 string
+	stopBroadcast             func()
+	stopLocalRelay            func()
+	isLocal                   bool
+	transportAddr             string
 	ctx                       context.Context
 	cancel                    context.CancelFunc
 	stopContext               func() bool
@@ -52,11 +59,74 @@ type Session struct {
 }
 
 func newSession(ctx context.Context, c *comm.Comm, components codephrase.ChatComponents, host bool, code, relay string, tm timings) *Session {
+	return newSessionWithLocal(ctx, c, nil, components, host, code, relay, tm)
+}
+
+func newSessionWithLocal(ctx context.Context, c *comm.Comm, localHost *localHostRelay, components codephrase.ChatComponents, host bool, code, relay string, tm timings) *Session {
 	ctx, cancel := context.WithCancel(ctx)
-	s := &Session{code: code, relay: relay, conn: c, ctx: ctx, cancel: cancel, times: tm, events: make(chan Event, 64), texts: make(chan outgoing, 64), controls: make(chan outgoing, 128), closeRequest: make(chan struct{}), closeExpiredCh: make(chan struct{}), done: make(chan struct{}), pending: make(map[uint64]pendingText), accepted: make(map[uint64]bool)}
-	s.stopContext = context.AfterFunc(ctx, c.Close)
+	s := &Session{
+		code:           code,
+		relay:          relay,
+		transportAddr:  relay,
+		conn:           c,
+		ctx:            ctx,
+		cancel:         cancel,
+		times:          tm,
+		events:         make(chan Event, 64),
+		texts:          make(chan outgoing, 64),
+		controls:       make(chan outgoing, 128),
+		closeRequest:   make(chan struct{}),
+		closeExpiredCh: make(chan struct{}),
+		done:           make(chan struct{}),
+		pending:        make(map[uint64]pendingText),
+		accepted:       make(map[uint64]bool),
+	}
+	if localHost != nil {
+		s.localConn = localHost.conn
+		s.localAddr = localHost.addr
+		s.stopBroadcast = localHost.stopBroadcast
+		s.stopLocalRelay = localHost.stopRelay
+		if s.conn == nil {
+			s.conn = s.localConn
+			s.localConn = nil
+			s.isLocal = true
+			s.transportAddr = s.localAddr
+		}
+	}
+	s.stopContext = context.AfterFunc(ctx, s.closeConnections)
 	go s.run(components, host)
 	return s
+}
+
+func (s *Session) setTransport(isLocal bool, addr string) {
+	s.mu.Lock()
+	s.isLocal = isLocal
+	s.transportAddr = addr
+	s.mu.Unlock()
+}
+
+func (s *Session) closeConnections() {
+	s.mu.Lock()
+	c := s.conn
+	lc := s.localConn
+	s.mu.Unlock()
+	if c != nil {
+		c.Close()
+	}
+	if lc != nil && lc != c {
+		lc.Close()
+	}
+}
+
+func (s *Session) cleanupLocal() {
+	s.mu.Lock()
+	stopRelay := s.stopLocalRelay
+	s.stopLocalRelay = nil
+	s.stopBroadcast = nil
+	s.mu.Unlock()
+	if stopRelay != nil {
+		stopRelay()
+	}
 }
 
 // emitLocked reserves one slot for the terminal event. Caller holds mu.
@@ -78,7 +148,8 @@ func (s *Session) requestClose(reason byte) {
 func (s *Session) run(components codephrase.ChatComponents, host bool) {
 	err := s.converse(components, host)
 	contextErr := s.ctx.Err()
-	s.conn.Close()
+	s.closeConnections()
+	s.cleanupLocal()
 	s.cancel()
 	s.stopContext()
 	s.mu.Lock()
@@ -138,11 +209,54 @@ func (s *Session) converse(components codephrase.ChatComponents, host bool) erro
 		defer close(authWatcherDone)
 		select {
 		case <-s.closeRequest:
-			s.conn.Close()
+			s.closeConnections()
 		case <-authDone:
 		}
 	}()
-	send, recv, err := handshake(s.conn, components, host, s.times.wait, s.times.auth)
+	var preReceived *message.Message
+	if host && s.localConn != nil && s.conn != nil {
+		winner, first, isLocal, raceErr := s.raceHostConnections(s.times.wait)
+		if raceErr != nil {
+			close(authDone)
+			<-authWatcherDone
+			s.mu.Lock()
+			closing := s.closing
+			s.mu.Unlock()
+			if closing {
+				return errBeforeReady
+			}
+			return errHandshake
+		}
+		s.mu.Lock()
+		s.conn = winner
+		s.localConn = nil
+		s.isLocal = isLocal
+		stopBroadcast := s.stopBroadcast
+		if isLocal {
+			s.transportAddr = s.localAddr
+		} else {
+			s.transportAddr = s.relay
+		}
+		s.mu.Unlock()
+		if isLocal {
+			if stopBroadcast != nil {
+				stopBroadcast()
+			}
+		} else {
+			s.cleanupLocal()
+		}
+		preReceived = first
+	}
+	send, recv, err := handshakeWithFirst(s.conn, components, host, preReceived, s.times.wait, s.times.auth)
+	if host {
+		s.mu.Lock()
+		isLocal := s.isLocal
+		stopBroadcast := s.stopBroadcast
+		s.mu.Unlock()
+		if isLocal && stopBroadcast != nil {
+			stopBroadcast()
+		}
+	}
 	close(authDone)
 	<-authWatcherDone
 	if err != nil {
