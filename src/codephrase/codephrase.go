@@ -18,6 +18,8 @@ const (
 	effWordCount         = 1296
 	roomHashSuffix       = "croc"
 	sshRoomHashSuffix    = "croc-ssh-v1"
+	chatRoomHashSuffix   = "croc-chat-v1"
+	ChatCodeWordCount    = 6
 	SSHCodeWordCount     = 6
 	sshCodeRoomWordCount = 2
 )
@@ -62,6 +64,30 @@ type Components struct {
 type SSHComponents struct {
 	RoomName       string
 	PAKEPassphrase string
+}
+
+// ChatComponents separates the public rendezvous room from the chat password.
+type ChatComponents struct {
+	RoomName       string
+	PAKEPassphrase string
+}
+
+// GenerateChat returns a fresh six-word invitation for one chat session.
+func GenerateChat() (string, error) {
+	return generateWords(rand.Reader, ChatCodeWordCount)
+}
+
+// ParseChat resolves a chat invitation without sharing its password with a relay.
+func ParseChat(secret string) (ChatComponents, error) {
+	words, ok := effWordSequence(strings.TrimSpace(secret), ChatCodeWordCount)
+	if !ok {
+		return ChatComponents{}, fmt.Errorf("invalid chat code: expected %d EFF words", ChatCodeWordCount)
+	}
+	digest := sha256.Sum256([]byte(strings.Join(words[:2], "-") + chatRoomHashSuffix))
+	return ChatComponents{
+		RoomName:       hex.EncodeToString(digest[:]),
+		PAKEPassphrase: strings.Join(words[2:], "-"),
+	}, nil
 }
 
 //go:embed wordlists/eff-short-wordlist-1.txt

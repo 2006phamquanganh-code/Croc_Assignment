@@ -55,7 +55,7 @@ func newApp() *cli.App {
 	app.Name = "croc"
 	app.Version = Version
 	app.Compiled = time.Now()
-	app.Usage = "securely transfer files or share a terminal"
+	app.Usage = "securely transfer files, chat, or share a terminal"
 	app.UsageText = `croc [GLOBAL OPTIONS] [COMMAND] [COMMAND OPTIONS] [filename(s) or folder]
 
    USAGE EXAMPLES:
@@ -79,6 +79,12 @@ func newApp() *cli.App {
 
    Store files for later download:
       croc store --downloads 3 --expiration 3d file.txt
+
+   Start an encrypted chat:
+      croc chat
+
+   Join an encrypted chat:
+      croc chat --join
 
    Share a terminal:
       croc ssh
@@ -125,6 +131,14 @@ func newApp() *cli.App {
 			),
 			HelpName: "croc store",
 			Action:   send,
+		},
+		{
+			Name:        "chat",
+			Usage:       "create or join an encrypted one-to-one terminal chat",
+			Description: "start without a code to host; use --join to paste a six-word invitation",
+			Flags:       []cli.Flag{&cli.BoolFlag{Name: "join", Usage: "join a chat by entering its invitation"}},
+			HelpName:    "croc chat",
+			Action:      chatSession,
 		},
 		{
 			Name:        "ssh",

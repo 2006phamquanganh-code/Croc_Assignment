@@ -14,6 +14,9 @@ croc \- transfer files, directories, and text using a short code
 .B croc ssh
 .RI [ options ]
 .br
+.B croc chat
+.RI [ --join ]
+.br
 .B croc relay
 .RI [ options ]
 .SH DESCRIPTION
@@ -56,6 +59,15 @@ expiration, download-limit, and storage service options.
 Share an interactive terminal using separate read/write and read-only invitations.
 An invitation grants the access described by the host until the session ends.
 .TP
+.B chat
+Create an encrypted one-to-one terminal chat. Share the printed six-word
+invitation privately; the other participant runs croc chat --join and pastes
+it at the hidden prompt. Both clients must support chat and use the same relay.
+Use /help, /clear, /quit or Ctrl+C. Receipt confirmations mean the peer client
+accepted a message, not that it was read. Messages are limited to 16 KiB.
+Sessions last at most two hours and end on disconnection. No history is saved
+by the application; terminal scrollback is outside that guarantee.
+.TP
 .B relay
 Run a relay explicitly. Installing this package does not start a relay service.
 .TP
@@ -90,7 +102,7 @@ Disable output.
 .SH ENVIRONMENT
 .TP
 .B CROC_SECRET
-The code or invitation used for a transfer or shared terminal.
+The code or invitation used for a transfer, shared terminal, or chat.
 .TP
 .B CROC_CONFIG_DIR
 Override the per-user configuration directory.

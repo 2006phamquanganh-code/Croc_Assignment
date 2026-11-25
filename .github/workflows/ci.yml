@@ -101,6 +101,15 @@ jobs:
       - name: Test portable path, redaction, and PAKE primitives
         run: go test ./src/receivefs ./src/redact ./src/pakekey
 
+      - name: Test secure chat protocol and CLI
+        run: go test ./src/chat ./src/codephrase ./src/cli -run 'Chat|Session|Handshake|Record|Directional|ReadyRecord|CloseInterrupts'
+
+      - name: Test real chat terminals on macOS
+        if: runner.os == 'macOS'
+        run: |
+          go build -o /tmp/croc-chat .
+          python3 scripts/test-chat-pty.py --binary /tmp/croc-chat
+
       - name: Test archive and marked-file regressions
         run: go test ./src/utils -run 'Test(UnzipDirectory|RemoveMarkedFiles|ValidFileName)'
 
@@ -148,6 +157,16 @@ jobs:
 
       - name: Race-test root-scoped and stored writes
         run: go test -race ./src/receivefs ./src/redact ./src/storecrypto ./src/storeclient ./src/store ./src/webcli ./src/webrelay
+
+      - name: Race-test secure chat and bidirectional deadlines
+        run: |
+          go test -race ./src/chat ./src/comm
+          go test -race ./src/cli -run Chat
+
+      - name: Test real chat terminals on Linux
+        run: |
+          go build -o /tmp/croc-chat .
+          python3 scripts/test-chat-pty.py --binary /tmp/croc-chat
 
       - name: Race-test archive and marked-file regressions
         run: go test -race ./src/utils -run 'Test(UnzipDirectory|RemoveMarkedFiles)'

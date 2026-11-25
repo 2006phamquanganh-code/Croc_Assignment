@@ -243,13 +243,8 @@ func (c *Comm) readWithDeadlineInto(dst []byte, readDeadline time.Time, maxMessa
 	if maxMessageSize < 0 || uint64(maxMessageSize) > uint64(^uint32(0)) {
 		return nil, 0, nil, fmt.Errorf("invalid maximum message size %d", maxMessageSize)
 	}
-	// Clear stale connection deadlines before applying the deadline for this
-	// read. The previous ordering cleared the read deadline immediately after
-	// setting it, leaving header reads unbounded.
-	if err = c.connection.SetDeadline(time.Time{}); err != nil {
-		err = fmt.Errorf("failed to clear deadline: %w", err)
-		return
-	}
+	// Reads own only the read deadline. Clearing the whole connection deadline
+	// here would silently cancel a concurrent writer's timeout.
 	if err = c.connection.SetReadDeadline(readDeadline); err != nil {
 		err = fmt.Errorf("error setting read deadline: %w", err)
 		return

@@ -1,0 +1,139 @@
+package chat
+
+import (
+	"context"
+	"errors"
+	"strings"
+	"time"
+
+	"github.com/schollz/croc/v11/src/codephrase"
+	"github.com/schollz/croc/v11/src/publicrelay"
+	"github.com/schollz/croc/v11/src/tcp"
+)
+
+// EventType identifies a lifecycle or delivery event. Acknowledged means the
+// remote client accepted the message, not that a person read it.
+type EventType uint8
+
+const (
+	Connected EventType = iota + 1
+	MessageReceived
+	Sent
+	Acknowledged
+	Uncertain
+	Closed
+	Failed
+)
+
+type Event struct {
+	Type   EventType
+	ID     uint64
+	Text   string
+	Reason byte
+	Err    error
+}
+
+type Config struct {
+	RelayAddress  string
+	RelayPassword string
+}
+
+var (
+	ErrNotConnected = errors.New("chat is not connected")
+	ErrQueueFull    = errors.New("chat send queue is full")
+	ErrText         = errors.New("chat text must be valid UTF-8 and between 1 and 16384 bytes")
+	ErrDisconnected = errors.New("chat connection ended without an authenticated close")
+	ErrOverloaded   = errors.New("chat event or control queue is full")
+	ErrTimeout      = errors.New("chat peer did not respond in time")
+)
+
+type timings struct{ wait, auth, ready, write, heartbeat, pong, ack, lifetime, close time.Duration }
+
+func defaults() timings {
+	return timings{5 * time.Minute, 30 * time.Second, 10 * time.Second, 10 * time.Second, 30 * time.Second, 90 * time.Second, 30 * time.Second, 2 * time.Hour, 2 * time.Second}
+}
+
+// StartHost admits a fresh, single-use invitation before returning. Handshake
+// proceeds asynchronously; callers should consume Events immediately.
+func StartHost(ctx context.Context, cfg Config) (*Session, error) {
+	code, err := codephrase.GenerateChat()
+	if err != nil {
+		return nil, errors.New("could not generate chat invitation")
+	}
+	return connect(ctx, cfg, code, true)
+}
+
+// Join authenticates asynchronously after relay admission.
+func Join(ctx context.Context, cfg Config, code string) (*Session, error) {
+	return connect(ctx, cfg, strings.TrimSpace(code), false)
+}
+
+func connect(ctx context.Context, cfg Config, code string, host bool) (*Session, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	components, err := codephrase.ParseChat(code)
+	if err != nil {
+		return nil, err
+	}
+	address := cfg.RelayAddress
+	if address == "" {
+		relays := publicrelay.Relays()
+		index, e := codephrase.RelayIndex(code, len(relays))
+		if e != nil {
+			return nil, e
+		}
+		address = relays[index]
+	}
+	admission, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	c, _, _, _, err := tcp.ConnectToTCPServerControlContext(admission, address, cfg.RelayPassword, components.RoomName, 30*time.Second)
+	if err != nil {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		if admission.Err() != nil {
+			return nil, admission.Err()
+		}
+		return nil, errors.New("could not join chat relay; check relay settings and availability")
+	}
+	return newSession(ctx, c, components, host, code, address, defaults()), nil
+}
+
+// Code is the host's invitation. Callers must not log it or persist it.
+func (s *Session) Code() string         { s.mu.Lock(); defer s.mu.Unlock(); return s.code }
+func (s *Session) RelayAddress() string { return s.relay }
+func (s *Session) Events() <-chan Event { return s.events }
+func (s *Session) Wait() error          { <-s.done; s.mu.Lock(); defer s.mu.Unlock(); return s.err }
+
+// Close requests an authenticated shutdown, with an absolute bound even if the
+// writer is stuck. Repeated calls are safe; Wait reports the terminal outcome.
+func (s *Session) Close() { s.requestClose(closeNormal) }
+
+// SendText accepts a copy into a bounded queue. Success does not mean delivery.
+func (s *Session) SendText(text string) (uint64, error) {
+	if err := validateRecord(record{kind: typeText, seq: 1, payload: []byte(text)}); err != nil {
+		return 0, ErrText
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.active || s.closing {
+		return 0, ErrNotConnected
+	}
+	if s.outstanding >= 64 {
+		return 0, ErrQueueFull
+	}
+	s.id++
+	out := outgoing{kind: typeText, payload: []byte(text), id: s.id}
+	select {
+	case s.texts <- out:
+		s.outstanding++
+		if s.accepted == nil {
+			s.accepted = make(map[uint64]bool)
+		}
+		s.accepted[s.id] = false
+		return s.id, nil
+	default:
+		return 0, ErrQueueFull
+	}
+}

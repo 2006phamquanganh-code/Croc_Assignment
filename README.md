@@ -227,6 +227,48 @@ using the normal acceptance and overwrite handling. Paths containing `.ssh` or
 
 The code phrase is used to establish password-authenticated key agreement ([PAKE](https://en.wikipedia.org/wiki/Password-authenticated_key_agreement)) which generates a secret key for the sender and recipient to use for end-to-end encryption.
 
+### Encrypted terminal chat
+
+Both people need a croc build that includes `chat`. Create a private 1:1
+conversation with:
+
+```bash
+croc chat
+```
+
+Share the printed six-word invitation privately. The other person runs:
+
+```bash
+croc chat --join
+```
+
+Paste the invitation at the hidden prompt. `CROC_SECRET='...' croc chat` also
+joins, although setting secrets in shell commands may leave them in shell
+history. Chat authenticates the invitation using PAKE and encrypts each message
+with AES-GCM using separate keys for the two directions. No account or inbound
+port is needed. Both clients must use the same relay; for a custom relay, run
+`croc --relay relay.example.com:9009 --pass YOURPASSWORD chat` on the host and
+add `--join` on the other machine.
+
+Type messages after the secure connection is confirmed. A receipt means the
+other client accepted the message, not that the person read it. If an ACK is
+missing, delivery is uncertain; chat does not automatically resend. Use `/help`,
+`/clear`, `/quit`, Ctrl+C to leave, Ctrl+U to clear a draft, or `//text` to send
+text beginning with a slash. Incoming text is rendered without terminal control
+sequences. Messages are limited to 16 KiB of UTF-8 text.
+
+Chat requires an interactive input and output terminal. The application does
+not save message history or invitations. `/clear` clears the screen; terminal
+scrollback, screen recordings and operating-system memory are outside that
+guarantee. A conversation lasts at most two hours and ends on disconnection;
+start a new invitation to chat again. A public relay may close it sooner and
+can observe connection metadata. Anyone who knows the invitation can attempt
+to join, so treat it as a secret. Chat is an initial implementation and has not
+received an independent security audit.
+
+See the [secure chat specification](src/docs/SECURE_CHAT_SPEC.md) for the wire
+protocol, limits and validation plan.
+
 ### Share a terminal with `croc ssh`
 
 On Linux, macOS, FreeBSD, or OpenBSD, start a shared terminal with:
