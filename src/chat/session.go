@@ -25,6 +25,16 @@ type pendingText struct {
 	uncertain bool
 }
 
+type ephemeralKey struct {
+	outgoing bool
+	id       uint64
+}
+
+type ephemeralEntry struct {
+	buf   []byte
+	timer *time.Timer
+}
+
 // Session owns a single authenticated conversation and all of its goroutines.
 type Session struct {
 	code, relay               string
@@ -54,6 +64,7 @@ type Session struct {
 	outstanding               int
 	accepted                  map[uint64]bool // IDs accepted by SendText; value records an Uncertain event.
 	pending                   map[uint64]pendingText
+	ephemeral                 map[ephemeralKey]*ephemeralEntry
 	ping                      []byte
 	pingSent                  time.Time
 }
@@ -80,6 +91,7 @@ func newSessionWithLocal(ctx context.Context, c *comm.Comm, localHost *localHost
 		done:           make(chan struct{}),
 		pending:        make(map[uint64]pendingText),
 		accepted:       make(map[uint64]bool),
+		ephemeral:      make(map[ephemeralKey]*ephemeralEntry),
 	}
 	if localHost != nil {
 		s.localConn = localHost.conn
@@ -127,6 +139,51 @@ func (s *Session) cleanupLocal() {
 	if stopRelay != nil {
 		stopRelay()
 	}
+}
+
+// trackEphemeralLocked stores a TTL message buffer in RAM and schedules an
+// automatic zero-byte overwrite + MessageExpired event when ttl elapses.
+// Caller holds s.mu.
+func (s *Session) trackEphemeralLocked(outgoing bool, id uint64, data []byte, ttl time.Duration) {
+	if s.finished {
+		clear(data)
+		return
+	}
+	if s.ephemeral == nil {
+		s.ephemeral = make(map[ephemeralKey]*ephemeralEntry)
+	}
+	buf := append([]byte(nil), data...)
+	key := ephemeralKey{outgoing: outgoing, id: id}
+	entry := &ephemeralEntry{buf: buf}
+	entry.timer = time.AfterFunc(ttl, func() {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		cur, ok := s.ephemeral[key]
+		if !ok || cur != entry {
+			return
+		}
+		clear(cur.buf)
+		cur.buf = nil
+		delete(s.ephemeral, key)
+		if !s.finished {
+			s.emitLocked(Event{Type: MessageExpired, ID: id})
+		}
+	})
+	s.ephemeral[key] = entry
+}
+
+// wipeAllEphemeralLocked stops all pending TTL timers and overwrites every
+// retained TTL message buffer with zero bytes. Caller holds s.mu.
+func (s *Session) wipeAllEphemeralLocked() {
+	for key, entry := range s.ephemeral {
+		if entry.timer != nil {
+			entry.timer.Stop()
+		}
+		clear(entry.buf)
+		entry.buf = nil
+		delete(s.ephemeral, key)
+	}
+	s.ephemeral = nil
 }
 
 // emitLocked reserves one slot for the terminal event. Caller holds mu.
@@ -187,6 +244,7 @@ drained:
 	clear(s.ping)
 	s.ping = nil
 	s.pending = nil
+	s.wipeAllEphemeralLocked()
 	s.outstanding = 0
 	s.code = ""
 	terminal := Event{Type: Closed, Reason: s.closeReason, Err: err}
@@ -290,7 +348,7 @@ func (s *Session) converse(components codephrase.ChatComponents, host bool) erro
 		defer wg.Done()
 		s.writeLoop(workersCtx, send, readyDeadline, sentReady, sentClose, writerErrors)
 	}()
-	defer func() { cancel(); s.conn.Close(); wg.Wait() }()
+	defer func() { cancel(); s.conn.Close(); wg.Wait(); send.wipe(); recv.wipe() }()
 	readyTimer := time.NewTimer(time.Until(readyDeadline))
 	defer readyTimer.Stop()
 	localReady, remoteReady := false, false
@@ -446,7 +504,7 @@ func (s *Session) control(out outgoing) bool {
 func (s *Session) handleRecord(r record) error {
 	switch r.kind {
 	case typeText:
-		if !s.emit(Event{Type: MessageReceived, Text: string(r.payload)}) {
+		if !s.emit(Event{Type: MessageReceived, ID: r.seq, Text: string(r.payload)}) {
 			return ErrOverloaded
 		}
 		ref := make([]byte, 8)
@@ -454,6 +512,27 @@ func (s *Session) handleRecord(r record) error {
 		if !s.control(outgoing{kind: typeAck, payload: ref}) {
 			return ErrOverloaded
 		}
+	case typeTTLText:
+		ttl := time.Duration(binary.BigEndian.Uint32(r.payload[:4])) * time.Second
+		textBytes := r.payload[4:]
+		s.mu.Lock()
+		s.trackEphemeralLocked(false, r.seq, textBytes, ttl)
+		ok := s.emitLocked(Event{Type: MessageReceived, ID: r.seq, Text: string(textBytes), TTL: ttl})
+		s.mu.Unlock()
+		clear(r.payload)
+		if !ok {
+			return ErrOverloaded
+		}
+		ref := make([]byte, 8)
+		binary.BigEndian.PutUint64(ref, r.seq)
+		if !s.control(outgoing{kind: typeAck, payload: ref}) {
+			return ErrOverloaded
+		}
+	case typeTyping:
+		s.emit(Event{Type: PeerTyping, Typing: r.payload[0] == 1})
+	case typeKeyRotate:
+		epoch := binary.BigEndian.Uint64(r.payload)
+		s.emit(Event{Type: KeyRotated, ID: epoch})
 	case typeAck:
 		s.mu.Lock()
 		defer s.mu.Unlock()
@@ -524,6 +603,20 @@ func (s *Session) readLoop(ctx context.Context, c *recordCipher, readyDeadline t
 			}
 			return
 		}
+		if r.kind == typeKeyRotate {
+			if err := c.rotate(r.payload); err != nil {
+				clear(r.payload)
+				select {
+				case out <- readResult{err: errProtocol}:
+				case <-ctx.Done():
+				}
+				return
+			}
+			clear(r.payload)
+			epochBuf := make([]byte, 8)
+			binary.BigEndian.PutUint64(epochBuf, c.epoch)
+			r.payload = epochBuf
+		}
 		if !deliver(readResult{record: r}) || r.kind == typeClose {
 			return
 		}
@@ -540,7 +633,7 @@ func (s *Session) writeLoop(ctx context.Context, c *recordCipher, readyDeadline 
 		if err = s.conn.Connection().SetWriteDeadline(deadline); err != nil {
 			return err
 		}
-		if out.kind == typeText {
+		if out.kind == typeText || out.kind == typeTTLText {
 			s.mu.Lock()
 			s.pending[seq] = pendingText{id: out.id}
 			s.mu.Unlock()
@@ -551,7 +644,7 @@ func (s *Session) writeLoop(ctx context.Context, c *recordCipher, readyDeadline 
 		}
 		s.mu.Lock()
 		defer s.mu.Unlock()
-		if out.kind == typeText {
+		if out.kind == typeText || out.kind == typeTTLText {
 			if p, ok := s.pending[seq]; ok {
 				p.sent = time.Now()
 				s.pending[seq] = p
@@ -570,6 +663,7 @@ func (s *Session) writeLoop(ctx context.Context, c *recordCipher, readyDeadline 
 		return
 	}
 	close(ready)
+	sentMsgs := 0
 	for {
 		s.mu.Lock()
 		closing, reason := s.closing, s.closeReason
@@ -605,7 +699,6 @@ func (s *Session) writeLoop(ctx context.Context, c *recordCipher, readyDeadline 
 		closing = s.closing
 		s.mu.Unlock()
 		if closing {
-
 			clear(out.payload)
 			continue
 		}
@@ -614,6 +707,30 @@ func (s *Session) writeLoop(ctx context.Context, c *recordCipher, readyDeadline 
 		if err != nil {
 			errs <- err
 			return
+		}
+		if out.kind == typeText || out.kind == typeTTLText {
+			sentMsgs++
+			if sentMsgs >= keyRotateEvery && c.next < maxRecords-2 {
+				salt := make([]byte, keyRotateSalt)
+				if _, randErr := rand.Read(salt); randErr != nil {
+					errs <- randErr
+					return
+				}
+				rotErr := write(outgoing{kind: typeKeyRotate, payload: salt}, time.Now().Add(s.times.write))
+				if rotErr != nil {
+					clear(salt)
+					errs <- rotErr
+					return
+				}
+				if rotErr = c.rotate(salt); rotErr != nil {
+					clear(salt)
+					errs <- rotErr
+					return
+				}
+				clear(salt)
+				sentMsgs = 0
+				s.emit(Event{Type: KeyRotated, ID: c.epoch})
+			}
 		}
 	}
 }

@@ -2,6 +2,7 @@
 package chat
 
 import (
+	"encoding/binary"
 	"errors"
 	"unicode/utf8"
 )
@@ -12,6 +13,9 @@ const (
 	maxTextSize            = 16 << 10
 	maxRecords      uint64 = 1 << 20
 	headerSize             = 10
+	maxTTLSeconds   uint32 = 86400
+	keyRotateEvery         = 20
+	keyRotateSalt          = 32
 )
 
 type recordType byte
@@ -23,6 +27,9 @@ const (
 	typePing
 	typePong
 	typeClose
+	typeTTLText
+	typeTyping
+	typeKeyRotate
 )
 
 const (
@@ -66,6 +73,22 @@ func validateRecord(r record) error {
 		}
 	case typeClose:
 		if len(r.payload) != 1 || r.payload[0] > closeOverloaded {
+			return errProtocol
+		}
+	case typeTTLText:
+		if len(r.payload) <= 4 || len(r.payload) > 4+maxTextSize {
+			return errProtocol
+		}
+		ttlSec := binary.BigEndian.Uint32(r.payload[:4])
+		if ttlSec == 0 || ttlSec > maxTTLSeconds || !utf8.Valid(r.payload[4:]) {
+			return errProtocol
+		}
+	case typeTyping:
+		if len(r.payload) != 1 || (r.payload[0] != 0 && r.payload[0] != 1) {
+			return errProtocol
+		}
+	case typeKeyRotate:
+		if len(r.payload) != keyRotateSalt {
 			return errProtocol
 		}
 	default:

@@ -5,14 +5,16 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
+	"strconv"
 	"strings"
+	"time"
 	"unicode"
 	"unicode/utf8"
 
 	"github.com/rivo/uniseg"
 	"github.com/schollz/croc/v11/src/chat"
 	"golang.org/x/term"
-	"os"
 )
 
 type chatInputResult struct {
@@ -192,14 +194,21 @@ func runChatUI(ctx context.Context, s *chat.Session, input <-chan chatInputResul
 	historyBytes := 0
 	defer func() { clear(history) }()
 	active := false
+	peerTyping := false
+	var lastTypingSent time.Time
+	localTyping := false
 	redraw := func() {
 		width, _, err := term.GetSize(int(os.Stdout.Fd()))
 		if err != nil {
 			width = 80
 		}
-		fmt.Fprintf(output, "\r\x1b[2K> %s", chatDraftTail(editor.draft, width))
+		prefix := "> "
+		if peerTyping {
+			prefix = "[typing...] > "
+		}
+		fmt.Fprintf(output, "\r\x1b[2K%s%s", prefix, chatDraftTail(editor.draft, width))
 	}
-	line := func(text string) {
+	appendHistory := func(text string) {
 		history = append(history, text)
 		historyBytes += len(text)
 		for len(history) > 500 || historyBytes > 2<<20 {
@@ -207,7 +216,54 @@ func runChatUI(ctx context.Context, s *chat.Session, input <-chan chatInputResul
 			history[0] = ""
 			history = history[1:]
 		}
+	}
+	line := func(text string) {
+		appendHistory(text)
 		fmt.Fprintf(output, "\r\x1b[2K%s\r\n", text)
+	}
+	renderHistory := func(clearScrollback bool) {
+		if clearScrollback {
+			fmt.Fprint(output, "\x1b[2J\x1b[3J\x1b[H")
+		} else {
+			fmt.Fprint(output, "\x1b[2J\x1b[H")
+		}
+		for _, h := range history {
+			if h != "" {
+				fmt.Fprintf(output, "%s\r\n", h)
+			}
+		}
+	}
+	replaceLine := func(needle, replacement string, clearScrollback bool) bool {
+		replaced := false
+		for i, h := range history {
+			if strings.Contains(h, needle) {
+				historyBytes -= len(h)
+				history[i] = replacement
+				historyBytes += len(replacement)
+				replaced = true
+			}
+		}
+		if replaced {
+			renderHistory(clearScrollback)
+		}
+		return replaced
+	}
+	parseTTLCommand := func(raw string) (time.Duration, string, error) {
+		rest := strings.TrimSpace(strings.TrimPrefix(raw, "/ttl"))
+		fields := strings.SplitN(rest, " ", 2)
+		if len(fields) < 2 || strings.TrimSpace(fields[1]) == "" {
+			return 0, "", errors.New("usage: /ttl <seconds> <message> (e.g. /ttl 10 secret)")
+		}
+		durStr := strings.TrimSpace(fields[0])
+		var ttl time.Duration
+		if secs, err := strconv.Atoi(durStr); err == nil {
+			ttl = time.Duration(secs) * time.Second
+		} else if d, err := time.ParseDuration(durStr); err == nil {
+			ttl = d
+		} else {
+			return 0, "", errors.New("invalid TTL duration; use seconds like 10 or 30s")
+		}
+		return ttl, fields[1], nil
 	}
 	quit := false
 	submit := func(text string) bool {
@@ -216,6 +272,29 @@ func runChatUI(ctx context.Context, s *chat.Session, input <-chan chatInputResul
 			return false
 		}
 		if strings.HasPrefix(text, "/") && !strings.HasPrefix(text, "//") {
+			if text == "/ttl" || strings.HasPrefix(text, "/ttl ") {
+				if !active {
+					line("Waiting for the secure connection; draft kept.")
+					return false
+				}
+				ttl, msg, err := parseTTLCommand(text)
+				if err != nil {
+					line(err.Error())
+					return false
+				}
+				id, err := s.SendTTLText(msg, ttl)
+				if err != nil {
+					line("TTL message not queued; draft kept: " + safeChatText(err.Error()))
+					return false
+				}
+				if localTyping {
+					localTyping = false
+					_ = s.SendTyping(false)
+				}
+				pending[id] = true
+				line(fmt.Sprintf("You [%d] [TTL %s]: %s", id, ttl.Truncate(time.Second), safeChatText(msg)))
+				return true
+			}
 			switch text {
 			case "/quit":
 				quit = true
@@ -228,7 +307,7 @@ func runChatUI(ctx context.Context, s *chat.Session, input <-chan chatInputResul
 				fmt.Fprint(output, "\x1b[2J\x1b[H")
 				return true
 			case "/help":
-				line("/help  /status  /clear  /quit; start with // to send a leading slash")
+				line("/help  /status  /ttl <sec> <msg>  /clear  /quit; start with // to send a leading slash")
 				return true
 			case "/status":
 				line("Connection: " + safeChatText(s.TransportStats()))
@@ -249,6 +328,10 @@ func runChatUI(ctx context.Context, s *chat.Session, input <-chan chatInputResul
 		if err != nil {
 			line("Message not queued; draft kept: " + safeChatText(err.Error()))
 			return false
+		}
+		if localTyping {
+			localTyping = false
+			_ = s.SendTyping(false)
 		}
 		pending[id] = true
 		line(fmt.Sprintf("You [%d]: %s", id, safeChatText(text)))
@@ -273,6 +356,18 @@ func runChatUI(ctx context.Context, s *chat.Session, input <-chan chatInputResul
 				s.Close()
 				return s.Wait()
 			}
+			if active {
+				if len(editor.draft) > 0 {
+					if !localTyping || time.Since(lastTypingSent) >= 2*time.Second {
+						localTyping = true
+						lastTypingSent = time.Now()
+						_ = s.SendTyping(true)
+					}
+				} else if localTyping {
+					localTyping = false
+					_ = s.SendTyping(false)
+				}
+			}
 			redraw()
 		case e, ok := <-s.Events():
 			if !ok {
@@ -283,17 +378,50 @@ func runChatUI(ctx context.Context, s *chat.Session, input <-chan chatInputResul
 				active = true
 				line(fmt.Sprintf("Secure chat connected [%s]. /help lists commands; Ctrl+C exits.", safeChatText(s.TransportStats())))
 			case chat.MessageReceived:
-				line("Peer: " + safeChatText(e.Text))
+				peerTyping = false
+				if e.TTL > 0 {
+					line(fmt.Sprintf("Peer [%d] [TTL %s]: %s", e.ID, e.TTL.Truncate(time.Second), safeChatText(e.Text)))
+				} else {
+					line("Peer: " + safeChatText(e.Text))
+				}
+			case chat.MessageExpired:
+				needle := fmt.Sprintf("[%d] [TTL ", e.ID)
+				expiredLine := fmt.Sprintf("[TTL] Message [%d] expired and wiped.", e.ID)
+				if !replaceLine(needle, expiredLine, true) {
+					line(expiredLine)
+				}
+			case chat.PeerTyping:
+				peerTyping = e.Typing
+			case chat.KeyRotated:
+				line(fmt.Sprintf("[Security] Session AES-256-GCM key rotated via HKDF-SHA256 (epoch %d).", e.ID))
 			case chat.Sent:
 				if pending[e.ID] {
-					line(fmt.Sprintf("[%d] waiting for receipt", e.ID))
+					line(fmt.Sprintf("✓ [%d] waiting for receipt", e.ID))
 				}
 			case chat.Acknowledged:
 				delete(pending, e.ID)
-				line(fmt.Sprintf("[%d] received by peer", e.ID))
+				ackLine := fmt.Sprintf("✓✓ [%d] received by peer", e.ID)
+				waitNeedle := fmt.Sprintf("✓ [%d] waiting for receipt", e.ID)
+				removed := false
+				for i, h := range history {
+					if strings.HasPrefix(h, "✓✓ [") || strings.Contains(h, waitNeedle) {
+						historyBytes -= len(h)
+						history[i] = ""
+						removed = true
+					}
+				}
+				appendHistory(ackLine)
+				if removed {
+					renderHistory(false)
+				} else {
+					fmt.Fprintf(output, "\r\x1b[2K%s\r\n", ackLine)
+				}
 			case chat.Uncertain:
 				if pending[e.ID] {
-					line(fmt.Sprintf("[%d] delivery uncertain", e.ID))
+					uncertainLine := fmt.Sprintf("? [%d] delivery uncertain", e.ID)
+					if !replaceLine(fmt.Sprintf("✓ [%d] waiting for receipt", e.ID), uncertainLine, false) {
+						line(uncertainLine)
+					}
 				}
 			case chat.Closed, chat.Failed:
 				if len(pending) > 0 {

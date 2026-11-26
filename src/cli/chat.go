@@ -142,9 +142,11 @@ func chatSession(c *cli.Context) error {
 	if secret == "" {
 		if cfg.OnlyLocal {
 			fmt.Fprintf(os.Stdout, "Chat invitation: %s\r\nMode: Direct LAN only (%s)\r\nShare the invitation privately. Join on the same LAN with: croc --local chat --join\r\n", s.Code(), safeChatText(s.RelayAddress()))
-		} else {
+		} else if cfg.RelayAddress != "" {
 			fmt.Fprintf(os.Stdout, "Chat invitation: %s\r\nRelay: %s\r\nShare the invitation privately. Join with: croc --relay %s chat --join\r\n", s.Code(), safeChatText(s.RelayAddress()), safeChatText(s.RelayAddress()))
 			fmt.Fprint(os.Stdout, "Use the same --pass setting on the joining client if the relay requires one.\r\n")
+		} else {
+			fmt.Fprintf(os.Stdout, "Chat invitation: %s\r\nRelay: %s (auto LAN + relay)\r\nShare the invitation privately. Join with: croc chat --join\r\n", s.Code(), safeChatText(s.RelayAddress()))
 		}
 	}
 	fmt.Fprint(os.Stdout, "Waiting for authentication. Ctrl+C exits.\r\n")

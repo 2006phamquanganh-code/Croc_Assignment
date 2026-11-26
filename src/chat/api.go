@@ -2,6 +2,7 @@ package chat
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"strings"
 	"time"
@@ -23,12 +24,17 @@ const (
 	Uncertain
 	Closed
 	Failed
+	MessageExpired
+	PeerTyping
+	KeyRotated
 )
 
 type Event struct {
 	Type   EventType
 	ID     uint64
 	Text   string
+	TTL    time.Duration
+	Typing bool
 	Reason byte
 	Err    error
 }
@@ -45,6 +51,7 @@ var (
 	ErrNotConnected = errors.New("chat is not connected")
 	ErrQueueFull    = errors.New("chat send queue is full")
 	ErrText         = errors.New("chat text must be valid UTF-8 and between 1 and 16384 bytes")
+	ErrTTL          = errors.New("chat TTL must be between 1s and 24h")
 	ErrDisconnected = errors.New("chat connection ended without an authenticated close")
 	ErrOverloaded   = errors.New("chat event or control queue is full")
 	ErrTimeout      = errors.New("chat peer did not respond in time")
@@ -192,4 +199,64 @@ func (s *Session) SendText(text string) (uint64, error) {
 	default:
 		return 0, ErrQueueFull
 	}
+}
+
+// SendTTLText sends a self-destructing UTF-8 message. Both sender and receiver
+// retain the message bytes only until ttl expires, then overwrite the RAM
+// buffer with zero bytes and emit MessageExpired.
+func (s *Session) SendTTLText(text string, ttl time.Duration) (uint64, error) {
+	secs := int64(ttl / time.Second)
+	if ttl < time.Second || secs <= 0 || uint64(secs) > uint64(maxTTLSeconds) {
+		return 0, ErrTTL
+	}
+	payload := make([]byte, 4+len(text))
+	binary.BigEndian.PutUint32(payload[:4], uint32(secs))
+	copy(payload[4:], text)
+	if err := validateRecord(record{kind: typeTTLText, seq: 1, payload: payload}); err != nil {
+		clear(payload)
+		return 0, ErrText
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.active || s.closing {
+		clear(payload)
+		return 0, ErrNotConnected
+	}
+	if s.outstanding >= 64 {
+		clear(payload)
+		return 0, ErrQueueFull
+	}
+	s.id++
+	id := s.id
+	out := outgoing{kind: typeTTLText, payload: payload, id: id}
+	select {
+	case s.texts <- out:
+		s.outstanding++
+		if s.accepted == nil {
+			s.accepted = make(map[uint64]bool)
+		}
+		s.accepted[id] = false
+		s.trackEphemeralLocked(true, id, []byte(text), time.Duration(secs)*time.Second)
+		return id, nil
+	default:
+		clear(payload)
+		return 0, ErrQueueFull
+	}
+}
+
+// SendTyping notifies the remote peer whether the local user is currently
+// typing. It is best-effort and drops silently if the control queue is busy.
+func (s *Session) SendTyping(typing bool) error {
+	s.mu.Lock()
+	active := s.active && !s.closing
+	s.mu.Unlock()
+	if !active {
+		return ErrNotConnected
+	}
+	var b byte
+	if typing {
+		b = 1
+	}
+	s.control(outgoing{kind: typeTyping, payload: []byte{b}})
+	return nil
 }

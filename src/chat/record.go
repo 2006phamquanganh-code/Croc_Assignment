@@ -11,8 +11,10 @@ import (
 // recordCipher has one owner (reader or writer); it is never used concurrently.
 // Any I/O or decode error must terminate its session, without retrying a record.
 type recordCipher struct {
-	aead cipher.AEAD
-	next uint64
+	aead  cipher.AEAD
+	key   []byte
+	next  uint64
+	epoch uint64
 }
 
 func newRecordCipher(key []byte) (*recordCipher, error) {
@@ -23,7 +25,33 @@ func newRecordCipher(key []byte) (*recordCipher, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &recordCipher{aead: aead}, nil
+	keyCopy := append([]byte(nil), key...)
+	return &recordCipher{aead: aead, key: keyCopy}, nil
+}
+
+// rotate derives the next AES-256-GCM key via HKDF-SHA256 and wipes the old key
+// from RAM to preserve forward secrecy.
+func (c *recordCipher) rotate(salt []byte) error {
+	nextKey, err := deriveRotatedKey(c.key, salt, c.epoch+1)
+	if err != nil {
+		return err
+	}
+	nextAEAD, err := crypt.NewAESGCM(nextKey)
+	if err != nil {
+		clear(nextKey)
+		return err
+	}
+	clear(c.key)
+	c.key = nextKey
+	c.aead = nextAEAD
+	c.epoch++
+	return nil
+}
+
+// wipe zeroes the retained key material in RAM when the session ends.
+func (c *recordCipher) wipe() {
+	clear(c.key)
+	c.key = nil
 }
 
 func (c *recordCipher) seal(kind recordType, payload []byte) ([]byte, error) {

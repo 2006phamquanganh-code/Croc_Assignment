@@ -20,7 +20,7 @@ import (
 const (
 	chatLocalDiscoveryPrefix = "croc-chat:"
 	defaultMulticastAddress  = "239.255.255.250"
-	localDiscoveryTimeout    = 400 * time.Millisecond
+	localDiscoveryTimeout    = 800 * time.Millisecond
 	onlyLocalDiscoveryWindow = 2 * time.Second
 )
 
@@ -168,11 +168,18 @@ func discoverLocalChatAddresses(ctx context.Context, multicastAddr string, windo
 	results := make(chan []peerdiscovery.Discovered, 2)
 	run := func(ipv6 bool) {
 		settings := peerdiscovery.Settings{
-			Limit:     -1,
-			Payload:   []byte("croc-chat-probe"),
-			Delay:     20 * time.Millisecond,
-			TimeLimit: window,
-			StopChan:  stopChan,
+			Limit:            -1,
+			Payload:          []byte("croc-chat-probe"),
+			Delay:            20 * time.Millisecond,
+			TimeLimit:        window,
+			StopChan:         stopChan,
+			AllowSelf:        true,
+			DisableBroadcast: true,
+			Notify: func(d peerdiscovery.Discovered) {
+				if len(parseChatDiscoveryAddresses([]peerdiscovery.Discovered{d})) > 0 {
+					stop()
+				}
+			},
 		}
 		if ipv6 {
 			settings.IPVersion = peerdiscovery.IPv6
